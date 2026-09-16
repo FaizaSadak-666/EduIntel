@@ -31,3 +31,5 @@ app_final_backup.py
 # OS files
 .DS_Store
 Thumbs.db
+
+.streamlit/secrets.toml

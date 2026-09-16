@@ -303,7 +303,7 @@ if not st.session_state["logged_in"]:
             # Login validation
             if login_button:
 
-                if username == "admin" and password == "admin123":
+                if username == "admin" and password == st.secrets["login"]["password"]:
 
                     st.session_state["logged_in"] = True
 
