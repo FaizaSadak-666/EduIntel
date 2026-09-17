@@ -996,6 +996,119 @@ elif page == "👨‍🎓 Student Prediction":
         )
 
     # =========================================================
+    # ADD TRAINING RECORD
+    # =========================================================
+
+    st.divider()
+
+    st.subheader("📚 Add Training Record")
+
+    st.write(
+        "Enter the actual final marks of a completed student "
+        "to add the record to the AI training dataset."
+    )
+
+    actual_final_marks = st.slider(
+        "🎯 Actual Final Marks",
+        min_value=0,
+        max_value=100,
+        value=70,
+        key="actual_final_marks"
+    )
+
+    add_training_button = st.button(
+        "💾 Add Training Record",
+        use_container_width=True,
+        key="add_training_record"
+    )
+
+    if add_training_button:
+
+        if student_id.strip() == "" or student_name.strip() == "":
+            st.warning(
+                "⚠️ Please enter both Student ID and Student Name."
+            )
+
+        else:
+
+            # Check whether Student ID already exists
+            cursor.execute(
+                "SELECT Student_ID FROM students WHERE Student_ID = ?",
+                (student_id,)
+            )
+
+            existing_student = cursor.fetchone()
+
+            if existing_student:
+
+                cursor.execute(
+                    """
+                    UPDATE students
+                    SET
+                        Name = ?,
+                        Attendance = ?,
+                        Assignment_Score = ?,
+                        Internal_Marks = ?,
+                        Study_Hours = ?,
+                        Previous_Marks = ?,
+                        Actual_Final_Marks = ?,
+                        Final_Marks = ?
+                    WHERE Student_ID = ?
+                    """,
+                    (
+                        student_name,
+                        attendance,
+                        assignment,
+                        internal,
+                        study_hours,
+                        previous_marks,
+                        actual_final_marks,
+                        actual_final_marks,
+                        student_id
+                    )
+                )
+
+            else:
+
+                cursor.execute(
+                    """
+                    INSERT INTO students (
+                        Student_ID,
+                        Name,
+                        Attendance,
+                        Assignment_Score,
+                        Internal_Marks,
+                        Study_Hours,
+                        Previous_Marks,
+                        Final_Marks,
+                        Actual_Final_Marks
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        student_id,
+                        student_name,
+                        attendance,
+                        assignment,
+                        internal,
+                        study_hours,
+                        previous_marks,
+                        actual_final_marks,
+                        actual_final_marks
+                    )
+                )
+
+            connection.commit()
+
+            st.success(
+                f"✅ Training record for {student_name} "
+                "was added successfully."
+            )
+
+            st.rerun()
+
+
+    # =========================================================
     # PREDICT BUTTON
     # =========================================================
 
