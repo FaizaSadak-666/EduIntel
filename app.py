@@ -1566,6 +1566,318 @@ elif page == "📊 Class Analytics":
     )
 
     st.divider()
+
+    # =========================================================
+    # STUDENT PERFORMANCE DETAILS
+    # =========================================================
+
+
+    # =========================================================
+    # SEARCH STUDENT
+    # =========================================================
+
+    st.subheader("🔎 Search Student")
+
+    search_query = st.text_input(
+        "Search by Student Name or Student ID",
+        placeholder="Enter student name or ID...",
+        key="analytics_student_search"
+    )
+
+    if search_query.strip():
+
+        search_results = analytics_data[
+            analytics_data["Name"].astype(str).str.contains(
+                search_query.strip(),
+                case=False,
+                na=False
+            )
+            |
+            analytics_data["Student_ID"].astype(str).str.contains(
+                search_query.strip(),
+                case=False,
+                na=False
+            )
+        ]
+
+        if not search_results.empty:
+
+            st.success(
+                f"{len(search_results)} matching student(s) found."
+            )
+
+            st.dataframe(
+                search_results[
+                    [
+                        "Student_ID",
+                        "Name",
+                        "Attendance",
+                        "Assignment_Score",
+                        "Internal_Marks",
+                        "Study_Hours",
+                        "Previous_Marks",
+                        "Display_Final_Marks",
+                        "Performance_Category"
+                    ]
+                ].rename(
+                    columns={
+                        "Display_Final_Marks": "Final_Marks"
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.warning(
+                "No student found. Check the name or Student ID."
+            )
+
+    else:
+
+        st.caption(
+            "Enter a student name or ID to find their academic record."
+        )
+
+    st.divider()
+
+
+
+    st.subheader("👨‍🎓 Student Performance Details")
+
+    display_columns = [
+        "Student_ID",
+        "Name",
+        "Attendance",
+        "Assignment_Score",
+        "Internal_Marks",
+        "Study_Hours",
+        "Previous_Marks",
+        "Display_Final_Marks",
+        "Performance_Category"
+    ]
+
+    student_details = analytics_data[display_columns].copy()
+
+    student_details = student_details.rename(columns={
+        "Display_Final_Marks": "Final_Marks"
+    })
+
+    st.dataframe(
+        student_details,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.divider()
+
+    # =========================================================
+    # AT-RISK STUDENT ANALYSIS
+    # =========================================================
+
+    st.subheader("🚨 At-Risk Student Analysis")
+
+    risk_data = analytics_data[
+        analytics_data["Performance_Category"] == "At Risk"
+    ].copy()
+
+    if not risk_data.empty:
+
+        st.warning(
+            f"{len(risk_data)} student(s) may need additional "
+            "academic support."
+        )
+
+        st.dataframe(
+            risk_data[
+                [
+                    "Student_ID",
+                    "Name",
+                    "Attendance",
+                    "Display_Final_Marks",
+                    "Study_Hours"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "Students are identified as at risk if their final "
+            "marks are below 60 or attendance is below 75%."
+        )
+
+    else:
+
+        st.success(
+            "No students are currently identified as at risk."
+        )
+
+    st.divider()
+
+    # =========================================================
+    # ATTENDANCE ANALYSIS
+    # =========================================================
+
+    st.subheader("📅 Attendance Analysis")
+
+    attendance_data = analytics_data.dropna(
+        subset=["Attendance"]
+    ).copy()
+
+    if not attendance_data.empty:
+
+        avg_attendance = attendance_data["Attendance"].mean()
+
+        low_attendance_count = (
+            attendance_data["Attendance"] < 75
+        ).sum()
+
+        attendance_col1, attendance_col2 = st.columns(2)
+
+        with attendance_col1:
+            st.metric(
+                "📅 Average Attendance",
+                f"{avg_attendance:.1f}%"
+            )
+
+        with attendance_col2:
+            st.metric(
+                "⚠️ Students Below 75%",
+                int(low_attendance_count)
+            )
+
+        st.bar_chart(
+            attendance_data.set_index("Name")[["Attendance"]],
+            use_container_width=True
+        )
+
+    else:
+
+        st.info("Attendance data is not available.")
+
+    st.divider()
+
+    # =========================================================
+    # ACADEMIC PERFORMANCE ANALYSIS
+    # =========================================================
+
+    st.subheader("📈 Academic Performance Analysis")
+
+    marks_data = analytics_data.dropna(
+        subset=["Display_Final_Marks"]
+    ).copy()
+
+    if not marks_data.empty:
+
+        marks_data = marks_data.sort_values(
+            "Display_Final_Marks",
+            ascending=False
+        )
+
+        st.bar_chart(
+            marks_data.set_index("Name")[["Display_Final_Marks"]],
+            use_container_width=True
+        )
+
+        st.caption(
+            "This chart compares students based on their available "
+            "final marks, including actual or predicted marks."
+        )
+
+    else:
+
+        st.info("Final marks are not available for analysis.")
+
+    st.divider()
+
+    # =========================================================
+    # CLASS PERFORMANCE INSIGHTS
+    # =========================================================
+
+    st.subheader("🧠 Class Performance Insights")
+
+    avg_attendance = analytics_data["Attendance"].mean()
+    avg_study_hours = analytics_data["Study_Hours"].mean()
+
+    insight_col1, insight_col2 = st.columns(2)
+
+    with insight_col1:
+
+        if pd.notna(avg_attendance) and avg_attendance < 75:
+
+            st.warning(
+                "📅 Class attendance is below 75%. "
+                "Attendance monitoring may be helpful."
+            )
+
+        elif pd.notna(avg_attendance):
+
+            st.success(
+                f"📅 Average attendance is {avg_attendance:.1f}%."
+            )
+
+        else:
+
+            st.info("Attendance insights are unavailable.")
+
+    with insight_col2:
+
+        if pd.notna(avg_study_hours) and avg_study_hours < 3:
+
+            st.warning(
+                "⏱️ Average study time is below 3 hours per day. "
+                "Encourage consistent study habits."
+            )
+
+        elif pd.notna(avg_study_hours):
+
+            st.success(
+                f"⏱️ Average study time is {avg_study_hours:.1f} "
+                "hours per day."
+            )
+
+        else:
+
+            st.info("Study-hour insights are unavailable.")
+
+    st.divider()
+
+    # =========================================================
+    # DOWNLOAD CLASS PERFORMANCE REPORT
+    # =========================================================
+
+    st.subheader("📥 Download Class Performance Report")
+
+    report_columns = [
+        "Student_ID",
+        "Name",
+        "Attendance",
+        "Assignment_Score",
+        "Internal_Marks",
+        "Study_Hours",
+        "Previous_Marks",
+        "Display_Final_Marks",
+        "Performance_Category"
+    ]
+
+    class_report = analytics_data[report_columns].copy()
+
+    class_report = class_report.rename(columns={
+        "Display_Final_Marks": "Final_Marks"
+    })
+
+    csv_report = class_report.to_csv(index=False)
+
+    st.download_button(
+        label="📥 Download Class Report (CSV)",
+        data=csv_report,
+        file_name="EduIntel_Class_Performance_Report.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
 # =========================================================
 # RECOMMENDATIONS
 # =========================================================
