@@ -364,7 +364,8 @@ cursor.execute(
         Previous_Marks REAL,
         Final_Marks REAL,
         Actual_Final_Marks REAL,
-        Predicted_Final_Marks REAL
+        Predicted_Final_Marks REAL,
+        Record_Type TEXT DEFAULT 'Prediction'
     )
     """
 )
@@ -389,20 +390,32 @@ if "Predicted_Final_Marks" not in existing_columns:
         "ALTER TABLE students ADD COLUMN Predicted_Final_Marks REAL"
     )
 
+if "Record_Type" not in existing_columns:
+    cursor.execute(
+        "ALTER TABLE students ADD COLUMN Record_Type TEXT DEFAULT 'Prediction'"
+    )
+
 # ---------------------------------------------------------
-# MIGRATE EXISTING FINAL MARKS TO ACTUAL FINAL MARKS
+# RESTORE HISTORICAL TRAINING RECORDS
 # ---------------------------------------------------------
 
-cursor.execute(
-    """
+# Older EduIntel records stored actual marks in Final_Marks.
+# Restore those marks into Actual_Final_Marks.
+
+cursor.execute("""
     UPDATE students
     SET Actual_Final_Marks = Final_Marks
     WHERE Actual_Final_Marks IS NULL
-    AND Final_Marks IS NOT NULL
-    """
-)
+      AND Final_Marks IS NOT NULL
+""")
 
+# Mark records with actual final marks as training records.
 
+cursor.execute("""
+    UPDATE students
+    SET Record_Type = 'Training'
+    WHERE Actual_Final_Marks IS NOT NULL
+""")
 
 connection.commit()
 
@@ -434,84 +447,148 @@ features = [
     "Previous_Marks"
 ]
 
-# Use ONLY students who have real final marks
-training_data = data.dropna(
-    subset=["Actual_Final_Marks"]
-).copy()
+# ---------------------------------------------------------
+# PREPARE VALID TRAINING DATA
+# ---------------------------------------------------------
+
+training_data = data[
+    data["Actual_Final_Marks"].notna()
+].copy()
+
+# Ensure model inputs and target are numeric
+training_data[features] = training_data[features].apply(
+    pd.to_numeric,
+    errors="coerce"
+)
+
+training_data["Actual_Final_Marks"] = pd.to_numeric(
+    training_data["Actual_Final_Marks"],
+    errors="coerce"
+)
+
+# Remove incomplete or invalid training rows
+training_data = training_data.dropna(
+    subset=features + ["Actual_Final_Marks"]
+)
+
+
+# =========================================================
+# TRAIN AI MODEL AND EVALUATE PERFORMANCE
+# =========================================================
+
+from sklearn.model_selection import KFold, cross_val_predict
+
+# Initialize model variables
+model = None
+mae = float("nan")
+r2 = float("nan")
+cv_r2 = float("nan")
+
+feature_importance = pd.DataFrame(
+    columns=["Feature", "Importance"]
+)
+
+comparison_data = pd.DataFrame(
+    columns=[
+        "Actual Marks",
+        "Predicted Marks",
+        "Prediction Error"
+    ]
+)
+
+# ---------------------------------------------------------
+# TRAIN ONLY WITH VALID TRAINING RECORDS
+# ---------------------------------------------------------
 
 if len(training_data) >= 6:
 
     X = training_data[features]
     y = training_data["Actual_Final_Marks"]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
+    # -----------------------------------------------------
+    # CROSS-VALIDATION
+    # -----------------------------------------------------
+
+    cv_folds = min(5, len(training_data) // 2)
+
+    kf = KFold(
+        n_splits=cv_folds,
+        shuffle=True,
         random_state=42
     )
 
-    model = LinearRegression()
+    # Out-of-fold predictions:
+    # Each record is predicted by a model that did not
+    # train on that record.
 
-    model.fit(
-        X_train,
-        y_train
-    )
-
-    feature_importance = pd.DataFrame({
-        "Feature": X.columns,
-        "Importance": model.coef_
-    })
-
-    feature_importance["Absolute_Importance"] = (
-        feature_importance["Importance"].abs()
-    )
-
-    feature_importance = feature_importance.sort_values(
-        "Absolute_Importance",
-        ascending=False
-    )
-
-    cv_scores = cross_val_score(
-        model,
+    cv_predictions = cross_val_predict(
+        LinearRegression(),
         X,
         y,
-        cv=3,
-        scoring="r2"
+        cv=kf
     )
 
-    cv_r2 = cv_scores.mean()
-
-    predictions = model.predict(X_test)
+    # -----------------------------------------------------
+    # EVALUATION METRICS
+    # -----------------------------------------------------
 
     mae = mean_absolute_error(
-        y_test,
-        predictions
+        y,
+        cv_predictions
     )
 
     r2 = r2_score(
-        y_test,
-        predictions
+        y,
+        cv_predictions
     )
 
-else:
+    # Use the same out-of-fold predictions for both
+    # overall R² and prediction error.
+    # Do not average unstable fold R² values.
 
-    model = None
-    predictions = []
-    mae = None
-    r2 = None
-    cv_r2 = None
+    cv_r2 = r2
 
-    feature_importance = pd.DataFrame(
-        columns=[
-            "Feature",
-            "Importance",
-            "Absolute_Importance"
-        ]
+    # -----------------------------------------------------
+    # PREDICTED VS ACTUAL COMPARISON
+    # -----------------------------------------------------
+
+    comparison_data = pd.DataFrame({
+        "Actual Marks": y.to_numpy(),
+        "Predicted Marks": cv_predictions
+    })
+
+    comparison_data["Prediction Error"] = (
+        comparison_data["Actual Marks"]
+        - comparison_data["Predicted Marks"]
     )
 
-    y_test = pd.Series(
-        dtype=float
+    comparison_data = comparison_data.round(2)
+
+    # -----------------------------------------------------
+    # TRAIN FINAL MODEL USING ALL TRAINING DATA
+    # -----------------------------------------------------
+
+    model = LinearRegression()
+
+    model.fit(X, y)
+
+    # -----------------------------------------------------
+    # FEATURE IMPORTANCE
+    # -----------------------------------------------------
+
+    feature_importance = pd.DataFrame({
+        "Feature": features,
+        "Importance": model.coef_
+    })
+
+    feature_importance["Importance"] = (
+        feature_importance["Importance"].round(3)
+    )
+
+    feature_importance = feature_importance.sort_values(
+        by="Importance",
+        key=abs,
+        ascending=False
     )
 
 # =========================================================
@@ -638,14 +715,27 @@ if page == "🏠 Dashboard":
 
     st.subheader("📊 Performance Distribution")
 
-    performance_summary = data["Display_Final_Marks"].apply(
-        lambda x:
-            "High Performer"
-            if pd.notna(x) and x >= 80
-            else "Average Performer"
-            if pd.notna(x) and x >= 60
-            else "Needs Improvement"
-    ).value_counts()
+    dashboard_data = data.copy()
+
+    dashboard_data["Performance_Category"] = dashboard_data.apply(
+        lambda row:
+            "At Risk"
+            if (
+                (pd.notna(row["Display_Final_Marks"]) and row["Display_Final_Marks"] < 60)
+                or
+                (pd.notna(row["Attendance"]) and row["Attendance"] < 75)
+            )
+            else "No Marks"
+            if pd.isna(row["Display_Final_Marks"])
+            else "High Performer"
+            if row["Display_Final_Marks"] >= 80
+            else "Average Performer",
+        axis=1
+    )
+
+    performance_summary = dashboard_data[
+        "Performance_Category"
+    ].value_counts()
 
     st.bar_chart(
         performance_summary,
@@ -939,7 +1029,7 @@ elif page == "👨‍🎓 Student Prediction":
     student_id = st.text_input(
     "Student ID",
     placeholder="Enter student ID",
-    key="new_student_id"
+    key="new_student_id" 
     )
 
     # =========================================================
@@ -981,7 +1071,7 @@ elif page == "👨‍🎓 Student Prediction":
         study_hours = st.slider(
             "⏱️ Study Hours per Day",
             min_value=0.0,
-            max_value=10.0,
+            max_value=12.0,
             value=3.0,
             step=0.5,
             key="prediction_study_hours"
@@ -995,119 +1085,7 @@ elif page == "👨‍🎓 Student Prediction":
             key="prediction_previous_marks"
         )
 
-    # =========================================================
-    # ADD TRAINING RECORD
-    # =========================================================
-
-    st.divider()
-
-    st.subheader("📚 Add Training Record")
-
-    st.write(
-        "Enter the actual final marks of a completed student "
-        "to add the record to the AI training dataset."
-    )
-
-    actual_final_marks = st.slider(
-        "🎯 Actual Final Marks",
-        min_value=0,
-        max_value=100,
-        value=70,
-        key="actual_final_marks"
-    )
-
-    add_training_button = st.button(
-        "💾 Add Training Record",
-        use_container_width=True,
-        key="add_training_record"
-    )
-
-    if add_training_button:
-
-        if student_id.strip() == "" or student_name.strip() == "":
-            st.warning(
-                "⚠️ Please enter both Student ID and Student Name."
-            )
-
-        else:
-
-            # Check whether Student ID already exists
-            cursor.execute(
-                "SELECT Student_ID FROM students WHERE Student_ID = ?",
-                (student_id,)
-            )
-
-            existing_student = cursor.fetchone()
-
-            if existing_student:
-
-                cursor.execute(
-                    """
-                    UPDATE students
-                    SET
-                        Name = ?,
-                        Attendance = ?,
-                        Assignment_Score = ?,
-                        Internal_Marks = ?,
-                        Study_Hours = ?,
-                        Previous_Marks = ?,
-                        Actual_Final_Marks = ?,
-                        Final_Marks = ?
-                    WHERE Student_ID = ?
-                    """,
-                    (
-                        student_name,
-                        attendance,
-                        assignment,
-                        internal,
-                        study_hours,
-                        previous_marks,
-                        actual_final_marks,
-                        actual_final_marks,
-                        student_id
-                    )
-                )
-
-            else:
-
-                cursor.execute(
-                    """
-                    INSERT INTO students (
-                        Student_ID,
-                        Name,
-                        Attendance,
-                        Assignment_Score,
-                        Internal_Marks,
-                        Study_Hours,
-                        Previous_Marks,
-                        Final_Marks,
-                        Actual_Final_Marks
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        student_id,
-                        student_name,
-                        attendance,
-                        assignment,
-                        internal,
-                        study_hours,
-                        previous_marks,
-                        actual_final_marks,
-                        actual_final_marks
-                    )
-                )
-
-            connection.commit()
-
-            st.success(
-                f"✅ Training record for {student_name} "
-                "was added successfully."
-            )
-
-            st.rerun()
-
-
+    
     # =========================================================
     # PREDICT BUTTON
     # =========================================================
@@ -1188,7 +1166,8 @@ elif page == "👨‍🎓 Student Prediction":
 
             if existing_student:
 
-                # Update existing student without changing Actual_Final_Marks
+                # Update existing student
+                # Keep Training records as Training
                 cursor.execute(
                     """
                     UPDATE students
@@ -1199,7 +1178,12 @@ elif page == "👨‍🎓 Student Prediction":
                         Internal_Marks = ?,
                         Study_Hours = ?,
                         Previous_Marks = ?,
-                        Predicted_Final_Marks = ?
+                        Predicted_Final_Marks = ?,
+                        Record_Type = CASE
+                            WHEN Actual_Final_Marks IS NOT NULL
+                            THEN 'Training'
+                            ELSE 'Prediction'
+                        END
                     WHERE Student_ID = ?
                     """,
                     (
@@ -1216,7 +1200,7 @@ elif page == "👨‍🎓 Student Prediction":
 
             else:
 
-                # Insert new student
+                # Insert new prediction record
                 cursor.execute(
                     """
                     INSERT INTO students (
@@ -1227,9 +1211,10 @@ elif page == "👨‍🎓 Student Prediction":
                         Internal_Marks,
                         Study_Hours,
                         Previous_Marks,
-                        Predicted_Final_Marks
+                        Predicted_Final_Marks,
+                        Record_Type
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Prediction')
                     """,
                     (
                         student_id,
@@ -1454,6 +1439,7 @@ elif page == "👨‍🎓 Student Prediction":
 # =========================================================
 # CLASS ANALYTICS
 # =========================================================
+
 elif page == "📊 Class Analytics":
 
     st.title("📊 Class Analytics")
@@ -1475,7 +1461,38 @@ elif page == "📊 Class Analytics":
 
         st.stop()
 
-    
+    # =========================================================
+    # PREPARE ANALYTICS DATA
+    # =========================================================
+
+    analytics_data = data.copy()
+
+    def performance_category(row):
+
+        marks = row["Display_Final_Marks"]
+        attendance = row["Attendance"]
+
+        if (
+            (pd.notna(marks) and marks < 60)
+            or
+            (pd.notna(attendance) and attendance < 75)
+        ):
+            return "At Risk"
+
+        if pd.isna(marks):
+            return "No Marks"
+
+        if marks >= 80:
+            return "High Performer"
+
+        return "Average Performer"
+
+    analytics_data["Performance_Category"] = (
+        analytics_data.apply(
+            performance_category,
+            axis=1
+        )
+    )
 
     # =========================================================
     # CLASS OVERVIEW
@@ -1483,57 +1500,42 @@ elif page == "📊 Class Analytics":
 
     st.subheader("📌 Class Overview")
 
-    total_students = len(data)
-    average_marks = data["Display_Final_Marks"].mean()
-    highest_marks = data["Display_Final_Marks"].max()
-    lowest_marks = data["Display_Final_Marks"].min()
+    total_students = len(analytics_data)
 
-    high_performers = len(
-        data[data["Display_Final_Marks"] >= 80]
-    )
+    average_marks = analytics_data["Display_Final_Marks"].mean()
 
-    average_performers = len(
-        data[
-            (data["Display_Final_Marks"] >= 60)
-            & (data["Display_Final_Marks"] < 80)
-        ]
-    )
+    highest_marks = analytics_data["Display_Final_Marks"].max()
 
-    at_risk_students = len(
-        data[data["Display_Final_Marks"] < 60]
-    )
+    lowest_marks = analytics_data["Display_Final_Marks"].min()
+
+    high_performers = (
+        analytics_data["Performance_Category"] == "High Performer"
+    ).sum()
+
+    average_performers = (
+        analytics_data["Performance_Category"] == "Average Performer"
+    ).sum()
+
+    at_risk_students = (
+        analytics_data["Performance_Category"] == "At Risk"
+    ).sum()
 
     col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        st.metric(
-            "👥 Total Students",
-            total_students
-        )
+        st.metric("👥 Total Students", total_students)
 
     with col2:
-        st.metric(
-            "📊 Average Marks",
-            f"{average_marks:.1f}"
-        )
+        st.metric("📊 Average Marks", f"{average_marks:.1f}")
 
     with col3:
-        st.metric(
-            "🏆 Highest Marks",
-            f"{highest_marks:.1f}"
-        )
+        st.metric("🏆 Highest Marks", f"{highest_marks:.1f}")
 
     with col4:
-        st.metric(
-            "📉 Lowest Marks",
-            f"{lowest_marks:.1f}"
-        )
+        st.metric("📉 Lowest Marks", f"{lowest_marks:.1f}")
 
     with col5:
-        st.metric(
-            "🔴 At Risk",
-            at_risk_students
-        )
+        st.metric("🔴 At Risk", at_risk_students)
 
     st.divider()
 
@@ -1543,52 +1545,19 @@ elif page == "📊 Class Analytics":
 
     st.subheader("🎯 Performance Categories")
 
-    
-    def performance_category(marks):
-
-      if pd.isna(marks):
-        return "No Marks"
-
-      if marks >= 80:
-        return "High Performer"
-
-      elif marks >= 60:
-        return "Average Performer"
-
-      else:
-        return "At Risk"
-
-    analytics_data = data.copy()
-
-    analytics_data["Performance_Category"] = (
-        analytics_data["Display_Final_Marks"].apply(
-            performance_category
-        )
-    )
-
     category_col1, category_col2, category_col3 = st.columns(3)
 
     with category_col1:
-        st.metric(
-            "🏆 High Performers",
-            high_performers
-        )
+        st.metric("🏆 High Performers", high_performers)
 
     with category_col2:
-        st.metric(
-            "🟡 Average Performers",
-            average_performers
-        )
+        st.metric("🟡 Average Performers", average_performers)
 
     with category_col3:
-        st.metric(
-            "🔴 At Risk Students",
-            at_risk_students
-        )
+        st.metric("🔴 At Risk Students", at_risk_students)
 
     performance_counts = (
-        analytics_data["Performance_Category"]
-        .value_counts()
+        analytics_data["Performance_Category"].value_counts()
     )
 
     st.bar_chart(
@@ -1597,520 +1566,6 @@ elif page == "📊 Class Analytics":
     )
 
     st.divider()
-
-    # =========================================================
-    # CLASS PERFORMANCE SUMMARY
-    # =========================================================
-
-    st.subheader("📈 Class Performance Summary")
-
-    summary_data = pd.DataFrame(
-        {
-            "Performance Factor": [
-                "Attendance",
-                "Assignment Score",
-                "Internal Marks",
-                "Study Hours",
-                "Previous Marks",
-                "Final Marks"
-            ],
-            "Class Average": [
-                data["Attendance"].mean(),
-                data["Assignment_Score"].mean(),
-                data["Internal_Marks"].mean(),
-                data["Study_Hours"].mean(),
-                data["Previous_Marks"].mean(),
-                data["Display_Final_Marks"].mean()
-            ]
-        }
-    )
-
-    summary_data["Class Average"] = (
-        summary_data["Class Average"].round(2)
-    )
-
-    st.dataframe(
-        summary_data,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.divider()
-
-    # =========================================================
-    # TOP PERFORMING STUDENTS
-    # =========================================================
-
-    st.subheader("🏆 Top Performing Students")
-
-    top_students = (
-        analytics_data
-        .sort_values(
-            by="Display_Final_Marks",
-            ascending=False
-        )
-        .head(5)
-    )
-
-    st.dataframe(
-        top_students[
-            [
-                "Student_ID",
-                "Name",
-                "Display_Final_Marks",
-                "Performance_Category"
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.divider()
-
-    # =========================================================
-    # STUDENTS NEEDING ATTENTION
-    # =========================================================
-
-    st.subheader("⚠️ Students Needing Attention")
-
-    low_performers = (
-        analytics_data[
-        (analytics_data["Display_Final_Marks"] < 60)
-        | (analytics_data["Attendance"] < 75)
-    ].sort_values(
-        by="Display_Final_Marks",
-        ascending=True
-    )
-    )
-
-    if len(low_performers) > 0:
-
-        st.warning(
-            f"⚠️ {len(low_performers)} student(s) "
-            "may require academic attention."
-        )
-
-        st.dataframe(
-            low_performers[
-                [
-                    "Student_ID",
-                    "Name",
-                    "Attendance",
-                    "Display_Final_Marks",
-                    "Study_Hours",
-                    "Performance_Category"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.success(
-            "✅ No students currently require academic attention."
-        )
-
-    st.divider()
-
-    # =========================================================
-    # SEARCH STUDENT
-    # =========================================================
-
-    st.subheader("🔎 Search Student")
-
-    search_name = st.text_input(
-        "Enter student name",
-        placeholder="Type a student name...",
-        key="analytics_search_student"
-    )
-
-    if search_name.strip():
-
-        filtered_students = analytics_data[
-            analytics_data["Name"].str.contains(
-                search_name,
-                case=False,
-                na=False
-            )
-        ]
-
-        if len(filtered_students) > 0:
-
-            st.dataframe(
-                filtered_students,
-                use_container_width=True,
-                hide_index=True
-            )
-
-        else:
-
-            st.info(
-                "🔍 No student found with that name."
-            )
-
-        # =====================================================
-        # SELECTED STUDENT DETAILS
-        # =====================================================
-
-        if len(filtered_students) == 1:
-
-            student = filtered_students.iloc[0]
-
-            st.subheader(
-                f"👤 {student['Name']} - Student Details"
-            )
-
-            detail_col1, detail_col2, detail_col3 = (
-                st.columns(3)
-            )
-
-            detail_col4, detail_col5, detail_col6 = (
-                st.columns(3)
-            )
-
-            with detail_col1:
-
-                st.metric(
-                    "🎯 Final Marks",
-                    f"{student['Display_Final_Marks']:.1f}/100"
-                )
-
-            with detail_col2:
-
-                st.metric(
-                    "📅 Attendance",
-                    f"{student['Attendance']:.1f}%"
-                )
-
-            with detail_col3:
-
-                st.metric(
-                    "📚 Study Hours",
-                    f"{student['Study_Hours']:.1f}"
-                )
-
-            with detail_col4:
-
-                st.metric(
-                    "📝 Assignment",
-                    f"{student['Assignment_Score']:.1f}"
-                )
-
-            with detail_col5:
-
-                st.metric(
-                    "📖 Internal Marks",
-                    f"{student['Internal_Marks']:.1f}"
-                )
-
-            with detail_col6:
-
-                st.metric(
-                    "📊 Previous Marks",
-                    f"{student['Previous_Marks']:.1f}"
-                )
-
-            st.markdown("### 🎯 Performance Status")
-
-            if student["Display_Final_Marks"] >= 80:
-
-                st.success(
-                    "🟢 High Performer - Keep up the excellent work!"
-                )
-
-            elif student["Display_Final_Marks"] >= 60:
-
-                st.warning(
-                    "🟡 Average Performer - There is room for improvement."
-                )
-
-            else:
-
-                st.error(
-                    "🔴 At Risk - Additional academic support is recommended."
-                )
-
-            st.markdown("### 💡 Personalized Recommendation")
-
-            if student["Attendance"] < 75:
-
-                st.info(
-                    "📅 Improve attendance and maintain regular "
-                    "participation in classes."
-                )
-
-            elif student["Assignment_Score"] < 60:
-
-                st.info(
-                    "📝 Complete assignments regularly and "
-                    "improve assignment performance."
-                )
-
-            elif student["Internal_Marks"] < 60:
-
-                st.info(
-                    "📖 Focus more on internal assessments "
-                    "and subject preparation."
-                )
-
-            elif student["Study_Hours"] < 3:
-
-                st.info(
-                    "⏰ Increase daily study time to at least "
-                    "3 hours and follow a consistent schedule."
-                )
-
-            else:
-
-                st.success(
-                    "🌟 Excellent! Continue maintaining the "
-                    "current academic routine."
-                )
-
-    st.divider()
-
-    # =========================================================
-    # ATTENDANCE VS FINAL MARKS
-    # =========================================================
-
-    st.subheader("📅 Attendance vs Final Marks")
-
-    attendance_chart = data[
-        [
-            "Name",
-            "Attendance",
-            "Display_Final_Marks"
-        ]
-    ].set_index("Name")
-
-    st.line_chart(
-        attendance_chart[
-            [
-                "Attendance",
-                "Display_Final_Marks"
-            ]
-        ],
-        use_container_width=True
-    )
-
-    # =========================================================
-    # STUDY HOURS VS FINAL MARKS
-    # =========================================================
-
-    st.subheader("📚 Study Hours vs Final Marks")
-
-    study_chart = data[
-        [
-            "Name",
-            "Study_Hours",
-            "Display_Final_Marks"
-        ]
-    ].set_index("Name")
-
-    st.bar_chart(
-        study_chart[
-            [
-                "Study_Hours",
-                "Display_Final_Marks"
-            ]
-        ],
-        use_container_width=True
-    )
-
-    st.divider()
-    # =========================================================
-    # DOWNLOAD CLASS REPORT
-    # =========================================================
-
-    st.subheader("📥 Download Class Report")
-
-    class_report = data.copy()
-
-    class_report["Performance_Category"] = (
-        class_report["Display_Final_Marks"].apply(
-            performance_category
-        )
-    )
-
-    class_report = class_report[
-        [
-            "Student_ID",
-            "Name",
-            "Attendance",
-            "Assignment_Score",
-            "Internal_Marks",
-            "Study_Hours",
-            "Previous_Marks",
-            "Display_Final_Marks",
-            "Performance_Category"
-        ]
-    ]
-
-    class_report = class_report.rename(
-    columns={
-        "Display_Final_Marks": "Final_Marks"
-    }
-)
-
-    csv_class_report = class_report.to_csv(
-        index=False
-    )
-
-    st.download_button(
-        label="📥 Download Class Performance Report",
-        data=csv_class_report,
-        file_name="EduIntel_Class_Performance_Report.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-    st.divider()
-
-    # =========================================================
-    # AI-GENERATED CLASS INSIGHTS
-    # =========================================================
-
-    st.subheader("🤖 AI-Generated Class Insights")
-
-    highest_student = data.loc[
-        data["Display_Final_Marks"].idxmax(),
-        "Name"
-    ]
-
-    highest_marks_value = data["Display_Final_Marks"].max()
-
-    lowest_student = data.loc[
-        data["Display_Final_Marks"].idxmin(),
-        "Name"
-    ]
-
-    lowest_marks_value = data["Display_Final_Marks"].min()
-
-
-
-    attendance_corr = (
-        data["Attendance"]
-        .corr(data["Display_Final_Marks"])
-    )
-
-    study_corr = (
-        data["Study_Hours"]
-        .corr(data["Display_Final_Marks"])
-    )
-
-    insight_col1, insight_col2 = st.columns(2)
-
-    with insight_col1:
-
-        st.info(
-            f"⭐ **Top Performer**\n\n"
-            f"{highest_student} has the highest final "
-            f"score of {highest_marks_value:.1f}."
-        )
-
-    with insight_col2:
-
-        st.warning(
-            f"📉 **Lowest Performer**\n\n"
-            f"{lowest_student} has the lowest final "
-            f"score of {lowest_marks_value:.1f}."
-        )
-
-    st.info(
-        f"📊 **Class Average:** "
-        f"{average_marks:.1f} marks"
-    )
-
-    if attendance_corr >= 0.5:
-
-        st.write(
-            "📅 **Attendance Insight:** Attendance shows "
-            "a strong positive relationship with final marks."
-        )
-
-    elif attendance_corr >= 0.2:
-
-        st.write(
-            "📅 **Attendance Insight:** Attendance shows "
-            "a moderate positive relationship with final marks."
-        )
-
-    else:
-
-        st.write(
-            "📅 **Attendance Insight:** Attendance shows "
-            "a weak relationship with final marks."
-        )
-
-    if study_corr >= 0.5:
-
-        st.write(
-            "📚 **Study Hours Insight:** Study hours show "
-            "a strong positive relationship with final marks."
-        )
-
-    elif study_corr >= 0.2:
-
-        st.write(
-            "📚 **Study Hours Insight:** Study hours show "
-            "a moderate positive relationship with final marks."
-        )
-
-    else:
-
-        st.write(
-            "📚 **Study Hours Insight:** Study hours show "
-            "a weak relationship with final marks."
-        )
-
-
-    # =========================================================
-    # DELETE STUDENT
-    # =========================================================
-
-    st.divider()
-
-    st.subheader("🗑️ Delete Student Record")
-
-    delete_student_id = st.selectbox(
-        "Select Student ID to delete",
-        data["Student_ID"].tolist(),
-        key="delete_student"
-    )
-
-    confirm_delete = st.checkbox(
-        "⚠️ I confirm that I want to permanently delete this student",
-        key="confirm_delete"
-    )
-
-    if st.button("🗑️ Delete Selected Student"):
-
-        if not confirm_delete:
-
-            st.warning(
-                "⚠️ Please confirm the deletion before continuing."
-            )
-
-        else:
-
-            student_to_delete = data[
-                data["Student_ID"] == delete_student_id
-            ].iloc[0]
-
-            cursor.execute(
-                "DELETE FROM students WHERE Student_ID = ?",
-                (student_to_delete["Student_ID"],)
-            )
-
-            connection.commit()
-
-            st.success(
-                f"✅ Student '{student_to_delete['Name']}' has been deleted successfully."
-            )
-
-            st.rerun()    
-
 # =========================================================
 # RECOMMENDATIONS
 # =========================================================
@@ -2445,14 +1900,36 @@ elif page == "🤖 AI Model Performance":
             f"{cv_r2:.2f}"
         )
 
-        if cv_r2 >= 0.80:
-            st.success("🟢 Excellent model consistency")
+    if pd.isna(cv_r2):
 
-        elif cv_r2 >= 0.60:
-            st.info("🟡 Good model consistency")
+        st.warning(
+            "Cross-validation performance is unavailable."
+        )
 
-        else:
-            st.warning("🔴 Model consistency needs improvement")
+    elif cv_r2 >= 0.80:
+
+        st.success(
+            "🟢 Strong cross-validated predictive performance"
+        )
+
+    elif cv_r2 >= 0.60:
+
+        st.info(
+            "🟡 Moderate cross-validated predictive performance"
+        )
+
+    elif cv_r2 >= 0:
+
+        st.warning(
+            "🟠 Limited cross-validated predictive performance"
+        )
+
+    else:
+
+        st.error(
+            "🔴 The model performs worse than the "
+            "mean-prediction baseline on cross-validation."
+        )
          
     st.divider()
 
@@ -2505,42 +1982,38 @@ elif page == "🤖 AI Model Performance":
         "predicted marks match the students' actual final marks."
     )
 
-    comparison_data = pd.DataFrame({
-        "Actual Marks": y_test.values,
-        "Predicted Marks": predictions
-    })
+    
 
-    comparison_data["Predicted Marks"] = (
-        comparison_data["Predicted Marks"].round(2)
-    )
-
-    comparison_data["Prediction Error"] = (
-        comparison_data["Actual Marks"]
-        - comparison_data["Predicted Marks"]
-    )
-
-    # =========================================================
+       # =========================================================
     # PREDICTION ERROR ANALYSIS
     # =========================================================
 
-    mean_error = comparison_data["Prediction Error"].abs().mean()
+    if not comparison_data.empty:
+        mean_error = comparison_data["Prediction Error"].abs().mean()
+    else:
+        mean_error = float("nan")
 
-    if mean_error <= 2:
-        st.success(
-            f"🟢 Excellent prediction accuracy — "
-            f"average error is {mean_error:.2f} marks."
+    if pd.isna(mean_error):
+        st.warning(
+            "Prediction error is unavailable because "
+            "there are not enough valid evaluation records."
         )
 
     elif mean_error <= 5:
+        st.success(
+            f"Average prediction error: {mean_error:.2f} marks."
+        )
+
+    elif mean_error <= 15:
         st.info(
-            f"🟡 Good prediction accuracy — "
-            f"average error is {mean_error:.2f} marks."
+            f"Average prediction error: {mean_error:.2f} marks. "
+            "Prediction accuracy may need improvement."
         )
 
     else:
         st.warning(
-            f"🔴 Prediction error is relatively high — "
-            f"average error is {mean_error:.2f} marks."
+            f"Average prediction error: {mean_error:.2f} marks. "
+            "The model's predictions have substantial error."
         )
 
     st.dataframe(
@@ -2644,28 +2117,44 @@ elif page == "🤖 AI Model Performance":
 
     st.subheader("📊 AI Performance Interpretation")
 
-    if r2 >= 0.80 and cv_r2 >= 0.80:
+    if pd.isna(r2):
 
-        st.success(
-            "🟢 The AI model demonstrates strong predictive "
-            "performance. The high R² score and cross-validation "
-            "score indicate consistent prediction performance."
+        st.warning(
+            "Model performance cannot be evaluated "
+            "with the available training data."
         )
 
-    elif r2 >= 0.60 and cv_r2 >= 0.60:
+    elif r2 >= 0.80:
+
+        st.success(
+            "🟢 The model shows strong cross-validated "
+            "predictive performance on the available data. "
+            "Results should still be interpreted cautiously "
+            "because the dataset may be small."
+        )
+
+    elif r2 >= 0.60:
 
         st.info(
-            "🟡 The AI model demonstrates moderate predictive "
-            "performance. Additional student data may improve "
-            "model reliability."
+            "🟡 The model shows moderate cross-validated "
+            "predictive performance. More representative "
+            "training data may help assess its reliability."
+        )
+
+    elif r2 >= 0:
+
+        st.warning(
+            "🟠 The model shows limited predictive "
+            "performance. Its predictions may have "
+            "substantial error."
         )
 
     else:
 
-        st.warning(
-            "🔴 The AI model currently shows limited predictive "
-            "performance. More student data and improved features "
-            "may help improve prediction quality."
+        st.error(
+            "🔴 The model performs worse than a "
+            "mean-prediction baseline on the current "
+            "cross-validation evaluation."
         )
 
     # =========================================================
@@ -2674,29 +2163,12 @@ elif page == "🤖 AI Model Performance":
 
     st.subheader("🛡️ Model Reliability Summary")
 
-    if r2 >= 0.80 and cv_r2 >= 0.80:
-
-        st.success(
-            "🟢 **High Reliability**\n\n"
-            "The model shows strong predictive performance "
-            "and consistent results across validation datasets."
-        )
-
-    elif r2 >= 0.60 and cv_r2 >= 0.60:
-
-        st.info(
-            "🟡 **Moderate Reliability**\n\n"
-            "The model provides useful predictions, but adding "
-            "more student data may improve reliability."
-        )
-
-    else:
-
-        st.warning(
-            "🔴 **Low Reliability**\n\n"
-            "The current model requires improvement before its "
-            "predictions can be considered highly reliable."
-        )
+    st.warning(
+        "Model reliability has not been independently "
+        "established. Evaluation results depend on the "
+        "size and quality of the available training data. "
+        "Predictions should be treated as estimates."
+    )
 
     st.divider()
 
@@ -2799,7 +2271,9 @@ elif page == "🤖 AI Model Performance":
     # FINAL MESSAGE
     # =========================================================
 
-    st.success(
-        "✅ EduIntel AI model is ready to support student "
-        "performance prediction and academic analysis."
-    )
+    st.info(
+    "ℹ️ EduIntel generates student performance estimates "
+    "using Linear Regression. Prediction reliability depends "
+    "on the quality and quantity of available training data. "
+    "Results should support, not replace, academic judgment."
+)
