@@ -1,5 +1,9 @@
 import os
 import sqlite3
+import hashlib
+import secrets
+import hmac
+import re
 
 import streamlit as st
 import pandas as pd
@@ -184,63 +188,98 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================================================
-# TEACHER LOGIN
+# TEACHER ACCOUNT DATABASE
+# =========================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "eduintel.db")
+
+auth_connection = sqlite3.connect(DB_PATH)
+auth_cursor = auth_connection.cursor()
+
+auth_cursor.execute("""
+    CREATE TABLE IF NOT EXISTS teachers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+auth_connection.commit()
+
+
+# =========================================================
+# PASSWORD SECURITY FUNCTIONS
+# =========================================================
+
+def hash_password(password):
+    salt = secrets.token_hex(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        200000
+    ).hex()
+
+    return f"{salt}${password_hash}"
+
+
+def verify_password(password, stored_hash):
+    try:
+        salt, saved_hash = stored_hash.split("$")
+
+        password_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            200000
+        ).hex()
+
+        return hmac.compare_digest(
+            password_hash,
+            saved_hash
+        )
+
+    except (ValueError, AttributeError):
+        return False
+
+
+# =========================================================
+# SESSION STATE
 # =========================================================
 
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
+if "teacher_username" not in st.session_state:
+    st.session_state["teacher_username"] = ""
+
+
+# =========================================================
+# TEACHER LOGIN AND REGISTRATION
+# =========================================================
 
 if not st.session_state["logged_in"]:
 
-    # Create centered login layout
     left_space, login_column, right_space = st.columns(
         [1, 1.4, 1]
     )
 
     with login_column:
 
-        # Login card
         with st.container(border=True):
 
-            # Logo
             st.markdown(
                 """
-                <div style="
-                    text-align: center;
-                    font-size: 52px;
-                    margin-top: 10px;
-                    margin-bottom: 5px;
-                ">
+                <div style="text-align:center;font-size:52px;">
                     🎓
                 </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-            # Application name
-            st.markdown(
-                """
-                <h1 style="
-                    text-align: center;
-                    color: #111827;
-                    margin-bottom: 5px;
-                ">
+                <h1 style="text-align:center;color:#111827;">
                     EduIntel
                 </h1>
-                """,
-                unsafe_allow_html=True
-            )
-
-            # Application description
-            st.markdown(
-                """
-                <p style="
-                    text-align: center;
-                    color: #6b7280;
-                    font-size: 15px;
-                    margin-bottom: 25px;
-                ">
+                <p style="text-align:center;color:#6b7280;">
                     AI-Based Student Performance Intelligence System
                 </p>
                 """,
@@ -249,94 +288,194 @@ if not st.session_state["logged_in"]:
 
             st.divider()
 
-            # Login heading
-            st.markdown(
-                """
-                <h3 style="
-                    text-align: center;
-                    color: #111827;
-                    margin-bottom: 5px;
-                ">
-                    🔐 Teacher Login
-                </h3>
-                """,
-                unsafe_allow_html=True
-            )
+            login_tab, signup_tab = st.tabs([
+                "🔐 Teacher Login",
+                "📝 Teacher Sign Up"
+            ])
 
-            # Login description
-            st.markdown(
-                """
-                <p style="
-                    text-align: center;
-                    color: #9ca3af;
-                    font-size: 14px;
-                    margin-bottom: 20px;
-                ">
-                    Sign in to access the EduIntel dashboard
-                </p>
-                """,
-                unsafe_allow_html=True
-            )
+            # -------------------------------------------------
+            # LOGIN TAB
+            # -------------------------------------------------
 
-            # Username
-            username = st.text_input(
-                "👤 Username",
-                placeholder="Enter your username",
-                key="login_username"
-            )
+            with login_tab:
 
-            # Password
-            password = st.text_input(
-                "🔒 Password",
-                type="password",
-                placeholder="Enter your password",
-                key="login_password"
-            )
+                st.subheader("Welcome Back")
 
-            # Login button
-            login_button = st.button(
-                "🔐 Login to EduIntel",
-                use_container_width=True,
-                key="login_button"
-            )
+                login_username = st.text_input(
+                    "Username",
+                    key="login_username"
+                ).strip()
 
-            # Login validation
-            if login_button:
+                login_password = st.text_input(
+                    "Password",
+                    type="password",
+                    key="login_password"
+                )
 
-                if username == "admin" and password == st.secrets["login"]["password"]:
+                if st.button(
+                    "🔐 Login to EduIntel",
+                    use_container_width=True,
+                    key="teacher_login_button"
+                ):
 
-                    st.session_state["logged_in"] = True
+                    authenticated = False
 
-                    st.success(
-                        "✅ Login successful! Welcome to EduIntel."
-                    )
+                    # Admin login using Streamlit secrets
+                    if login_username == "admin":
 
-                    st.rerun()
+                        try:
+                            admin_password = st.secrets[
+                                "login"
+                            ]["password"]
 
-                else:
+                            if hmac.compare_digest(
+                                login_password,
+                                str(admin_password)
+                            ):
+                                authenticated = True
 
-                    st.error(
-                        "❌ Invalid username or password."
-                    )
+                        except Exception:
+                            st.error(
+                                "Admin credentials are not configured."
+                            )
 
-            # Demo credentials
-            st.markdown(
-                """
-                <div style="
-                    text-align: center;
-                    margin-top: 20px;
-                    color: #9ca3af;
-                    font-size: 13px;
-                ">
-                    Demo Login: <b>admin</b> / <b>admin123</b>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+                    # Registered teacher login
+                    else:
 
-    # Stop the rest of the application until login
+                        auth_cursor.execute(
+                            """
+                            SELECT password_hash
+                            FROM teachers
+                            WHERE username = ?
+                            """,
+                            (login_username,)
+                        )
+
+                        teacher_record = auth_cursor.fetchone()
+
+                        if teacher_record and verify_password(
+                            login_password,
+                            teacher_record[0]
+                        ):
+                            authenticated = True
+
+                    if authenticated:
+
+                        st.session_state["logged_in"] = True
+                        st.session_state["teacher_username"] = (
+                            login_username
+                        )
+
+                        st.rerun()
+
+                    else:
+                        st.error(
+                            "Invalid username or password."
+                        )
+
+            # -------------------------------------------------
+            # SIGN UP TAB
+            # -------------------------------------------------
+
+            with signup_tab:
+
+                st.subheader("Create Teacher Account")
+
+                st.caption(
+                    "Create an account to access EduIntel."
+                )
+
+                new_username = st.text_input(
+                    "Choose Username",
+                    key="signup_username"
+                ).strip()
+
+                new_password = st.text_input(
+                    "Create Password",
+                    type="password",
+                    key="signup_password"
+                )
+
+                confirm_password = st.text_input(
+                    "Confirm Password",
+                    type="password",
+                    key="signup_confirm_password"
+                )
+
+                st.caption(
+                    "Username: 4–20 characters; letters, numbers "
+                    "and underscores only. Password: at least "
+                    "8 characters."
+                )
+
+                if st.button(
+                    "📝 Create Teacher Account",
+                    use_container_width=True,
+                    key="teacher_signup_button"
+                ):
+
+                    if not re.fullmatch(
+                        r"[A-Za-z0-9_]{4,20}",
+                        new_username
+                    ):
+                        st.error(
+                            "Username must be 4–20 characters "
+                            "and contain only letters, numbers "
+                            "or underscores."
+                        )
+
+                    elif len(new_password) < 8:
+                        st.error(
+                            "Password must contain at least "
+                            "8 characters."
+                        )
+
+                    elif new_password != confirm_password:
+                        st.error(
+                            "Passwords do not match."
+                        )
+
+                    elif new_username.lower() == "admin":
+                        st.error(
+                            "This username is reserved."
+                        )
+
+                    else:
+
+                        try:
+                            auth_cursor.execute(
+                                """
+                                INSERT INTO teachers (
+                                    username,
+                                    password_hash
+                                )
+                                VALUES (?, ?)
+                                """,
+                                (
+                                    new_username,
+                                    hash_password(new_password)
+                                )
+                            )
+
+                            auth_connection.commit()
+
+                            st.success(
+                                "Teacher account created! "
+                                "Please log in using your new credentials."
+                            )
+
+                        except sqlite3.IntegrityError:
+                            st.error(
+                                "This username is already registered. "
+                                "Please choose another."
+                            )
+
     st.stop()
 
+
+# =========================================================
+# END OF LOGIN AND REGISTRATION
+# =========================================================
 
 # =========================================================
 # DATABASE SETUP
@@ -419,20 +558,36 @@ cursor.execute("""
 
 connection.commit()
 
+
+
 # =========================================================
-# LOAD STUDENT DATA FROM DATABASE
+# LOAD STUDENT DATA BASED ON USER ROLE
 # =========================================================
 
-data = pd.read_sql_query(
-    "SELECT * FROM students",
-    connection 
+current_username = st.session_state["teacher_username"]
+is_admin = current_username == "admin"
+
+if is_admin:
+    data = pd.read_sql_query(
+        "SELECT * FROM students",
+        connection
+    )
+else:
+    data = pd.read_sql_query(
+        """
+        SELECT *
+        FROM students
+        WHERE owner_username = ?
+        """,
+        connection,
+        params=(current_username,)
+    )
+
+data["Display_Final_Marks"] = (
+    data["Actual_Final_Marks"].fillna(
+        data["Predicted_Final_Marks"]
+    )
 )
-
-data["Display_Final_Marks"] = data["Actual_Final_Marks"].fillna(
-    data["Predicted_Final_Marks"]
-)
-
-
 
 
 # =========================================================
@@ -447,15 +602,30 @@ features = [
     "Previous_Marks"
 ]
 
-# ---------------------------------------------------------
-# PREPARE VALID TRAINING DATA
-# ---------------------------------------------------------
+# =========================================================
+# LOAD SHARED TRAINING DATA
+# =========================================================
 
-training_data = data[
-    data["Actual_Final_Marks"].notna()
-].copy()
+# Use the admin's existing historical records to train
+# the shared model for all teachers.
 
-# Ensure model inputs and target are numeric
+training_data = pd.read_sql_query(
+    """
+    SELECT Attendance,
+           Assignment_Score,
+           Internal_Marks,
+           Study_Hours,
+           Previous_Marks,
+           Actual_Final_Marks
+    FROM students
+    WHERE owner_username = 'admin'
+      AND Actual_Final_Marks IS NOT NULL
+      AND Student_ID NOT IN ('201', '202', '203', '204', '205')
+    """,
+    connection
+)
+
+# Convert training columns to numeric
 training_data[features] = training_data[features].apply(
     pd.to_numeric,
     errors="coerce"
@@ -466,19 +636,15 @@ training_data["Actual_Final_Marks"] = pd.to_numeric(
     errors="coerce"
 )
 
-# Remove incomplete or invalid training rows
+# Remove incomplete training records
 training_data = training_data.dropna(
     subset=features + ["Actual_Final_Marks"]
 )
 
-
 # =========================================================
-# TRAIN AI MODEL AND EVALUATE PERFORMANCE
+# INITIALIZE MODEL VARIABLES
 # =========================================================
 
-from sklearn.model_selection import KFold, cross_val_predict
-
-# Initialize model variables
 model = None
 mae = float("nan")
 r2 = float("nan")
@@ -496,85 +662,26 @@ comparison_data = pd.DataFrame(
     ]
 )
 
-# ---------------------------------------------------------
-# TRAIN ONLY WITH VALID TRAINING RECORDS
-# ---------------------------------------------------------
+# =========================================================
+# TRAIN SHARED MODEL
+# =========================================================
 
-if len(training_data) >= 6:
+# Linear Regression can be fitted with 2 or more
+# valid labelled records. Six is not required to predict.
+
+if len(training_data) >= 2:
 
     X = training_data[features]
     y = training_data["Actual_Final_Marks"]
 
-    # -----------------------------------------------------
-    # CROSS-VALIDATION
-    # -----------------------------------------------------
-
-    cv_folds = min(5, len(training_data) // 2)
-
-    kf = KFold(
-        n_splits=cv_folds,
-        shuffle=True,
-        random_state=42
-    )
-
-    # Out-of-fold predictions:
-    # Each record is predicted by a model that did not
-    # train on that record.
-
-    cv_predictions = cross_val_predict(
-        LinearRegression(),
-        X,
-        y,
-        cv=kf
-    )
-
-    # -----------------------------------------------------
-    # EVALUATION METRICS
-    # -----------------------------------------------------
-
-    mae = mean_absolute_error(
-        y,
-        cv_predictions
-    )
-
-    r2 = r2_score(
-        y,
-        cv_predictions
-    )
-
-    # Use the same out-of-fold predictions for both
-    # overall R² and prediction error.
-    # Do not average unstable fold R² values.
-
-    cv_r2 = r2
-
-    # -----------------------------------------------------
-    # PREDICTED VS ACTUAL COMPARISON
-    # -----------------------------------------------------
-
-    comparison_data = pd.DataFrame({
-        "Actual Marks": y.to_numpy(),
-        "Predicted Marks": cv_predictions
-    })
-
-    comparison_data["Prediction Error"] = (
-        comparison_data["Actual Marks"]
-        - comparison_data["Predicted Marks"]
-    )
-
-    comparison_data = comparison_data.round(2)
-
-    # -----------------------------------------------------
-    # TRAIN FINAL MODEL USING ALL TRAINING DATA
-    # -----------------------------------------------------
-
+    # Train the shared model using all available
+    # valid admin historical records.
     model = LinearRegression()
-
     model.fit(X, y)
 
-    # -----------------------------------------------------
+    # =====================================================
     # FEATURE IMPORTANCE
-    # -----------------------------------------------------
+    # =====================================================
 
     feature_importance = pd.DataFrame({
         "Feature": features,
@@ -591,13 +698,72 @@ if len(training_data) >= 6:
         ascending=False
     )
 
+    # =====================================================
+    # MODEL EVALUATION
+    # =====================================================
+
+    # Keep cross-validation metrics only when there are
+    # enough records for a more meaningful evaluation.
+    if len(training_data) >= 6:
+
+        from sklearn.model_selection import (
+            KFold,
+            cross_val_predict
+        )
+
+        cv_folds = min(5, len(training_data) // 2)
+
+        kf = KFold(
+            n_splits=cv_folds,
+            shuffle=True,
+            random_state=42
+        )
+
+        cv_predictions = cross_val_predict(
+            LinearRegression(),
+            X,
+            y,
+            cv=kf
+        )
+
+        mae = mean_absolute_error(
+            y,
+            cv_predictions
+        )
+
+        r2 = r2_score(
+            y,
+            cv_predictions
+        )
+
+        cv_r2 = r2
+
+        comparison_data = pd.DataFrame({
+            "Actual Marks": y.to_numpy(),
+            "Predicted Marks": cv_predictions
+        })
+
+        comparison_data["Prediction Error"] = (
+            comparison_data["Actual Marks"]
+            - comparison_data["Predicted Marks"]
+        )
+
+        comparison_data = comparison_data.round(2)
+
+
 # =========================================================
 # SIDEBAR NAVIGATION
 # =========================================================
 
 if st.sidebar.button("🚪 Logout"):
     st.session_state["logged_in"] = False
+    st.session_state["teacher_username"] = ""
     st.rerun()
+
+# Display logged-in teacher's username
+st.sidebar.success(
+    f"👤 Logged in: {st.session_state['teacher_username']}"
+)
 
 st.sidebar.title("🎓 EduIntel")
 st.sidebar.write("AI-Based Student Performance Intelligence")
@@ -1156,18 +1322,30 @@ elif page == "👨‍🎓 Student Prediction":
             # SAVE STUDENT TO DATABASE
             # -------------------------------------------------
 
-            # Check whether the Student ID already exists
+            # -------------------------------------------------
+            # SAVE STUDENT TO DATABASE WITH TEACHER OWNERSHIP
+            # -------------------------------------------------
+
+            # Use the currently logged-in account as the owner
+            owner_username = st.session_state["teacher_username"]
+
+            # Check whether this Student ID exists for THIS owner
             cursor.execute(
-                "SELECT Student_ID FROM students WHERE Student_ID = ?",
-                (student_id,)
+                """
+                SELECT Student_ID
+                FROM students
+                WHERE Student_ID = ?
+                  AND owner_username = ?
+                """,
+                (student_id.strip(), owner_username)
             )
 
             existing_student = cursor.fetchone()
 
             if existing_student:
 
-                # Update existing student
-                # Keep Training records as Training
+                # Update only this owner's existing student
+                # Preserve Training status when actual marks exist
                 cursor.execute(
                     """
                     UPDATE students
@@ -1185,22 +1363,24 @@ elif page == "👨‍🎓 Student Prediction":
                             ELSE 'Prediction'
                         END
                     WHERE Student_ID = ?
+                      AND owner_username = ?
                     """,
                     (
-                        student_name,
+                        student_name.strip(),
                         attendance,
                         assignment,
                         internal,
                         study_hours,
                         previous_marks,
                         float(prediction),
-                        student_id
+                        student_id.strip(),
+                        owner_username
                     )
                 )
 
             else:
 
-                # Insert new prediction record
+                # Insert a new student record for this owner
                 cursor.execute(
                     """
                     INSERT INTO students (
@@ -1212,19 +1392,21 @@ elif page == "👨‍🎓 Student Prediction":
                         Study_Hours,
                         Previous_Marks,
                         Predicted_Final_Marks,
-                        Record_Type
+                        Record_Type,
+                        owner_username
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Prediction')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Prediction', ?)
                     """,
                     (
-                        student_id,
-                        student_name,
+                        student_id.strip(),
+                        student_name.strip(),
                         attendance,
                         assignment,
                         internal,
                         study_hours,
                         previous_marks,
-                        float(prediction)
+                        float(prediction),
+                        owner_username
                     )
                 )
 
@@ -1644,7 +1826,7 @@ elif page == "📊 Class Analytics":
 
 
 
-    st.subheader("👨‍🎓 Student Performance Details")
+    st.subheader("👨‍🎓 Student Performance Details ")
 
     display_columns = [
         "Student_ID",
